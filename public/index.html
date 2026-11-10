@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="theme-color" content="#0a0c18">
+  <title>도트 유체</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <canvas id="view" aria-label="함께 휘젓는 도트 유체"></canvas>
+
+  <header class="hud">
+    <div class="panel">
+      <h1>도트 유체</h1>
+      <p class="row">
+        <span id="swatch" class="swatch" title="내 색"></span>
+        <span id="status">연결 중…</span>
+      </p>
+      <p class="row"><span id="count">1</span>명 접속 중</p>
+    </div>
+
+    <div class="panel">
+      <label class="row" for="quality">화질
+        <select id="quality">
+          <option value="auto">자동</option>
+          <option value="high">높음</option>
+          <option value="mid">보통</option>
+          <option value="low">낮음</option>
+          <option value="min">최저</option>
+        </select>
+      </label>
+      <p class="row dim"><span id="grid">–</span> · <span id="fps">–</span>fps</p>
+    </div>
+  </header>
+
+  <p id="hint" class="hint">화면을 문질러 유체를 휘저어 보세요</p>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>
