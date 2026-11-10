@@ -84,6 +84,60 @@ select {
   padding: 2px 4px;
 }
 
+button {
+  pointer-events: auto;
+  width: 100%;
+  margin-top: 6px;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 2px solid var(--line);
+  border-radius: 0;
+  padding: 4px 6px;
+  cursor: pointer;
+}
+
+button:hover, button:focus-visible { border-color: var(--text); }
+
+.qr {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(10, 12, 24, 0.6);
+  cursor: pointer;
+}
+
+.qr[hidden] { display: none; }
+
+.qr-card {
+  max-width: 100%;
+  padding: 16px;
+  text-align: center;
+  background: var(--bg);
+  border: 2px solid var(--line);
+}
+
+.qr-card img {
+  display: block;
+  width: min(260px, 70vw);
+  height: auto;
+  margin: 0 auto;
+  background: #fff;
+  image-rendering: pixelated;
+}
+
+.qr-card p { margin: 8px 0 0; }
+
+.qr-url {
+  font-size: 15px;
+  overflow-wrap: anywhere;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
 .hint {
   position: fixed;
   left: 0;

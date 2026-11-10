@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
+import QRCode from 'qrcode';
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -13,7 +14,7 @@ const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'publ
 
 const TICK_MS = 50; // 중계 주기
 const MAX_CLIENTS = 300;
-const MAX_PER_SECOND = 45; // 접속자 한 명이 초당 보낼 수 있는 붓질 수
+const MAX_PER_SECOND = 70; // 접속자 한 명이 초당 보낼 수 있는 입력 수 (손가락 두 개 기준)
 const MAX_BATCH = 600; // 한 주기에 전달하는 붓질 수 상한
 
 const MIME = {
@@ -42,6 +43,24 @@ const server = http.createServer((req, res) => {
   if (pathname === '/healthz') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, clients: wss.clients.size }));
+    return;
+  }
+
+  // 접속한 주소 그대로를 QR 코드로 만들어 준다 (시연 때 휴대폰 접속용).
+  if (pathname === '/qr.svg') {
+    const host = req.headers.host || '';
+    if (!/^[\w.\-:[\]]{1,255}$/.test(host)) {
+      res.writeHead(400).end();
+      return;
+    }
+    const proto = req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+    QRCode.toString(`${proto}://${host}/`, { type: 'svg', margin: 2, errorCorrectionLevel: 'M' }).then(
+      (svg) => {
+        res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-cache' });
+        res.end(svg);
+      },
+      () => res.writeHead(500).end(),
+    );
     return;
   }
 

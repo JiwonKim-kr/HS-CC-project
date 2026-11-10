@@ -1,236 +1,358 @@
-// 2D 격자 유체 솔버 (Stable Fluids 방식: 이류 → 압력 투영).
-// 격자가 작으므로 CPU의 Float32Array로 계산한다. 테두리 1칸은 경계 셀이다.
+// 2D 액체 솔버 (PIC/FLIP 방식).
+// 액체는 입자로 나르고, 압력은 격자에서 푼다. 입자가 없는 칸은 공기로 취급하므로
+// 중력에 끌려 떨어진 액체가 바닥에 고이고 수면이 생긴다.
+// 격자는 테두리 1칸이 벽이고, 좌표 단위는 칸이며 y는 아래 방향이다.
 
-const FIELDS = ['u', 'v', 'u0', 'v0', 'p', 'div', 'curl', 'r', 'g', 'b', 'r0', 'g0', 'b0'];
-const CARRIED = ['u', 'v', 'r', 'g', 'b'];
+const SOLID = 0, AIR = 1, LIQUID = 2;
+const REST = 2; // 가득 찬 칸 하나에 들어가는 입자 수
+const RAD = 0.36; // 입자 반지름 (칸)
+const MIN_DIST = RAD * 2;
+
+const PARTICLE_FIELDS = ['x', 'y', 'vx', 'vy', 'r', 'g', 'b', 'life'];
+const GRID_FIELDS = ['u', 'v', 'pu', 'pv', 'wu', 'wv', 'dens', 'cr', 'cg', 'cb'];
+const CLEARED = ['u', 'v', 'wu', 'wv', 'dens', 'cr', 'cg', 'cb']; // 단계마다 새로 채우는 격자
 
 export class Fluid {
   constructor(w, h) {
+    this.gravity = 2.6; // 화면 높이의 배수 / 초²
     this.iterations = 14; // 압력 반복 횟수
-    this.vorticity = 14; // 소용돌이 보강 세기
-    this.velDamping = 0.35; // 속도 감쇠 (1/초)
-    this.dyeDamping = 0.5; // 염료 감쇠 (1/초)
-    this.radius = 0.035; // 붓 반지름 (짧은 변 대비 비율)
+    this.flip = 0.8; // FLIP 비율 (나머지는 PIC, 낮을수록 출렁임이 빨리 잦아든다)
+    this.fill = 0.38; // 화면에서 액체가 차지할 수 있는 최대 비율
+    this.lifetime = 45; // 입자 수명(초): 오래된 액체는 증발한다
+    this.radius = 0.03; // 붓 반지름 (짧은 변 대비 비율)
+    this.flow = 0.3; // 한 번에 붓 넓이의 몇 배를 쏟을지
     this.force = 30; // 이동량 → 속도 변환 (1/초)
+    this.mix = 0.006; // 맞닿은 입자끼리 색이 섞이는 정도
+    this.count = 0;
     this._alloc(w, h);
   }
 
   _alloc(w, h) {
     this.w = w;
     this.h = h;
-    this.s = w + 2;
-    const n = (w + 2) * (h + 2);
-    for (const k of FIELDS) this[k] = new Float32Array(n);
+    const nx = (this.nx = w + 2), ny = (this.ny = h + 2);
+    const cells = nx * ny;
+    for (const k of GRID_FIELDS) this[k] = new Float32Array(cells);
+    this.type = new Uint8Array(cells);
+    this.p = new Float32Array(cells); // 압력 (다음 단계의 초기값으로 재사용)
+    this.cellStart = new Int32Array(cells + 1);
+    this.liquid = new Int32Array(cells); // 이번 단계의 액체 칸 목록
+    this.liquidCount = 0;
+    // 칸의 네 면이 열려 있는지(1) 벽인지(0)
+    for (const k of ['sl', 'sr', 'st', 'sb']) this[k] = new Float32Array(cells);
+    for (let j = 1; j < ny - 1; j++) {
+      for (let i = 1; i < nx - 1; i++) {
+        const c = i + j * nx;
+        this.sl[c] = i > 1 ? 1 : 0;
+        this.sr[c] = i < nx - 2 ? 1 : 0;
+        this.st[c] = j > 1 ? 1 : 0;
+        this.sb[c] = j < ny - 2 ? 1 : 0;
+      }
+    }
+    this.cap = Math.ceil(w * h * this.fill * REST);
+    for (const k of PARTICLE_FIELDS) this[k] = new Float32Array(this.cap);
+    this.sorted = new Int32Array(this.cap);
+    this.count = 0;
   }
 
-  // 격자 크기를 바꾸고 기존 상태를 새 격자로 옮긴다.
+  // 격자 크기를 바꾸고 액체를 옮긴다. 화면에서 차지하는 양이 유지되도록 입자 수를 조정한다.
   resize(w, h) {
     if (w === this.w && h === this.h) return;
-    const ow = this.w, oh = this.h, os = this.s;
-    const old = {};
-    for (const k of CARRIED) old[k] = this[k];
+    const old = { count: this.count };
+    for (const k of PARTICLE_FIELDS) old[k] = this[k];
+    const sx = w / this.w, sy = h / this.h;
+    const ratio = sx * sy;
     this._alloc(w, h);
-    const s = this.s;
-    for (const k of CARRIED) {
-      const src = old[k], dst = this[k];
-      const scale = k === 'u' ? w / ow : k === 'v' ? h / oh : 1;
-      for (let j = 1; j <= h; j++) {
-        const y = ((j - 0.5) / h) * oh + 0.5;
-        for (let i = 1; i <= w; i++) {
-          const x = ((i - 0.5) / w) * ow + 0.5;
-          dst[i + j * s] = scale * bilerp(src, os, x, y);
-        }
+    for (let i = 0; i < old.count; i++) {
+      const copies = Math.floor(ratio) + (Math.random() < ratio % 1 ? 1 : 0);
+      for (let c = 0; c < copies && this.count < this.cap; c++) {
+        const j = this.count++;
+        const jitter = c === 0 ? 0 : 1;
+        this.x[j] = 1 + (old.x[i] - 1) * sx + jitter * (Math.random() - 0.5);
+        this.y[j] = 1 + (old.y[i] - 1) * sy + jitter * (Math.random() - 0.5);
+        this.vx[j] = old.vx[i] * sx;
+        this.vy[j] = old.vy[i] * sy;
+        this.r[j] = old.r[i];
+        this.g[j] = old.g[i];
+        this.b[j] = old.b[i];
+        this.life[j] = old.life[i];
       }
     }
+    this._collide();
   }
 
-  // 정규화 좌표(0~1)의 끝점 (nx, ny)와 이동량 (ndx, ndy)로 붓질을 넣는다.
-  // 이동량이 0이면 그 자리에서 퍼지는 물방울로 처리한다.
-  splat(nx, ny, ndx, ndy, color) {
-    const { w, h, s, u, v, r, g, b } = this;
-    const rad = Math.max(1.6, this.radius * Math.min(w, h));
-    const x1 = nx * w + 0.5, y1 = ny * h + 0.5;
-    const ddx = ndx * w, ddy = ndy * h;
-    const len = Math.hypot(ddx, ddy);
-
-    if (len < 1e-6) {
-      this._burst(x1, y1, rad * 1.7, color);
-      return;
-    }
-
-    let tu = ddx * this.force, tv = ddy * this.force;
-    const speed = Math.hypot(tu, tv);
-    const maxSpeed = Math.min(w, h) * 6;
+  // 정규화 좌표(0~1)의 (nx, ny)에 액체를 쏟는다. (ndx, ndy)는 붓의 이동량으로, 초기 속도가 된다.
+  pour(nx, ny, ndx, ndy, color) {
+    const { w, h } = this;
+    const m = Math.min(w, h);
+    const rad = Math.max(1.2, this.radius * m);
+    let vx = ndx * w * this.force, vy = ndy * h * this.force;
+    const speed = Math.hypot(vx, vy), maxSpeed = m * 4;
     if (speed > maxSpeed) {
-      tu *= maxSpeed / speed;
-      tv *= maxSpeed / speed;
+      vx *= maxSpeed / speed;
+      vy *= maxSpeed / speed;
     }
-
-    // 빠르게 움직여도 선이 끊기지 않도록 구간을 나눠 찍는다.
-    const n = Math.min(24, Math.max(1, Math.ceil(len / (rad * 0.6))));
-    const amount = (0.25 + 0.75 * Math.min(1, len / rad)) / n;
-    const inv = 1 / (rad * rad);
-    for (let k = 1; k <= n; k++) {
-      const t = 1 - k / n;
-      const cx = x1 - ddx * t, cy = y1 - ddy * t;
-      const i0 = Math.max(1, Math.floor(cx - 2.5 * rad)), i1 = Math.min(w, Math.ceil(cx + 2.5 * rad));
-      const j0 = Math.max(1, Math.floor(cy - 2.5 * rad)), j1 = Math.min(h, Math.ceil(cy + 2.5 * rad));
-      for (let j = j0; j <= j1; j++) {
-        for (let i = i0; i <= i1; i++) {
-          const dx = i - cx, dy = j - cy;
-          const wgt = Math.exp(-(dx * dx + dy * dy) * inv);
-          const idx = i + j * s;
-          u[idx] += wgt * (tu - u[idx]);
-          v[idx] += wgt * (tv - v[idx]);
-          const a = wgt * amount;
-          r[idx] += a * color[0];
-          g[idx] += a * color[1];
-          b[idx] += a * color[2];
-        }
-      }
-    }
-  }
-
-  _burst(cx, cy, rad, color) {
-    const { w, h, s, u, v, r, g, b } = this;
-    const inv = 1 / (rad * rad);
-    const push = Math.min(w, h) * 1.2;
-    const i0 = Math.max(1, Math.floor(cx - 2.5 * rad)), i1 = Math.min(w, Math.ceil(cx + 2.5 * rad));
-    const j0 = Math.max(1, Math.floor(cy - 2.5 * rad)), j1 = Math.min(h, Math.ceil(cy + 2.5 * rad));
-    for (let j = j0; j <= j1; j++) {
-      for (let i = i0; i <= i1; i++) {
-        const dx = i - cx, dy = j - cy;
-        const wgt = Math.exp(-(dx * dx + dy * dy) * inv);
-        const idx = i + j * s;
-        u[idx] += (wgt * push * dx) / rad;
-        v[idx] += (wgt * push * dy) / rad;
-        const a = wgt * 1.4;
-        r[idx] += a * color[0];
-        g[idx] += a * color[1];
-        b[idx] += a * color[2];
-      }
+    const n = Math.max(1, Math.round(REST * Math.PI * rad * rad * this.flow));
+    const cx = 1 + nx * w, cy = 1 + ny * h;
+    const spread = m * 0.15;
+    for (let k = 0; k < n; k++) {
+      const a = Math.random() * Math.PI * 2, d = rad * Math.sqrt(Math.random());
+      // 가득 찼으면 기존 입자 하나를 무작위로 대체한다.
+      const i = this.count < this.cap ? this.count++ : (Math.random() * this.count) | 0;
+      this.x[i] = cx + Math.cos(a) * d;
+      this.y[i] = cy + Math.sin(a) * d;
+      this.vx[i] = vx + (Math.random() - 0.5) * spread;
+      this.vy[i] = vy + (Math.random() - 0.5) * spread;
+      this.r[i] = color[0];
+      this.g[i] = color[1];
+      this.b[i] = color[2];
+      this.life[i] = this.lifetime * (0.8 + 0.4 * Math.random());
     }
   }
 
   step(dt) {
+    // 간격이 0에 가까운 프레임은 건너뛴다 (압력을 시간 간격으로 나누므로 0이면 안 된다).
+    if (!(dt > 1e-4)) return;
     dt = Math.min(dt, 1 / 30);
-    this._confineVorticity(dt);
+    const sub = 2;
+    for (let s = 0; s < sub; s++) this._substep(dt / sub, s === 0);
+  }
 
-    this.u0.set(this.u);
-    this.v0.set(this.v);
-    const vk = 1 / (1 + dt * this.velDamping);
-    this._advect(this.u, this.u0, this.u0, this.v0, dt, vk);
-    this._advect(this.v, this.v0, this.u0, this.v0, dt, vk);
-    this._bound(this.u, 1);
-    this._bound(this.v, 2);
+  _substep(dt, separate) {
+    this._integrate(dt);
+    this._collide();
+    if (separate) {
+      this._separate();
+      this._collide();
+    }
+    this._toGrid();
+    this._solve(dt);
+    this._toParticles();
+  }
 
-    this._project();
+  _integrate(dt) {
+    const { x, y, vx, vy, life } = this;
+    const g = this.gravity * this.h * dt;
+    const maxV = 1.6 / dt; // 한 번에 1.6칸 넘게 움직이지 않게 한다
+    let n = this.count;
+    for (let i = 0; i < n; i++) {
+      life[i] -= dt;
+      if (life[i] <= 0) {
+        n--;
+        for (const k of PARTICLE_FIELDS) this[k][i] = this[k][n];
+        i--;
+        continue;
+      }
+      let ax = vx[i], ay = vy[i] + g;
+      if (ax > maxV) ax = maxV; else if (ax < -maxV) ax = -maxV;
+      if (ay > maxV) ay = maxV; else if (ay < -maxV) ay = -maxV;
+      vx[i] = ax;
+      vy[i] = ay;
+      x[i] += ax * dt;
+      y[i] += ay * dt;
+    }
+    this.count = n;
+  }
 
-    const dk = 1 / (1 + dt * this.dyeDamping);
-    for (const [a, a0] of [['r', 'r0'], ['g', 'g0'], ['b', 'b0']]) {
-      const src = this[a];
-      this[a] = this[a0];
-      this[a0] = src;
-      this._advect(this[a], src, this.u, this.v, dt, dk);
-      this._bound(this[a], 0);
+  _collide() {
+    const { x, y, vx, vy, count } = this;
+    const minX = 1 + RAD, maxX = this.nx - 1 - RAD;
+    const minY = 1 + RAD, maxY = this.ny - 1 - RAD;
+    for (let i = 0; i < count; i++) {
+      if (x[i] < minX) { x[i] = minX; if (vx[i] < 0) vx[i] = 0; }
+      else if (x[i] > maxX) { x[i] = maxX; if (vx[i] > 0) vx[i] = 0; }
+      if (y[i] < minY) { y[i] = minY; if (vy[i] < 0) vy[i] = 0; }
+      else if (y[i] > maxY) { y[i] = maxY; if (vy[i] > 0) vy[i] = 0; }
     }
   }
 
-  // 수치 확산으로 사라지는 작은 소용돌이를 되살린다.
-  _confineVorticity(dt) {
-    const { w, h, s, u, v, curl } = this;
-    if (this.vorticity <= 0) return;
-    for (let j = 1; j <= h; j++) {
-      for (let i = 1; i <= w; i++) {
-        const idx = i + j * s;
-        curl[idx] = 0.5 * (v[idx + 1] - v[idx - 1] - (u[idx + s] - u[idx - s]));
-      }
+  // 겹친 입자를 서로 밀어내 뭉침을 막고, 맞닿은 입자끼리 색을 조금씩 섞는다.
+  _separate() {
+    const { x, y, r, g, b, nx, count, cellStart, sorted } = this;
+    cellStart.fill(0);
+    for (let i = 0; i < count; i++) cellStart[(x[i] | 0) + (y[i] | 0) * nx]++;
+    let sum = 0;
+    for (let c = 0; c < cellStart.length; c++) {
+      sum += cellStart[c];
+      cellStart[c] = sum;
     }
-    const k = dt * this.vorticity;
-    for (let j = 2; j < h; j++) {
-      for (let i = 2; i < w; i++) {
-        const idx = i + j * s;
-        let gx = 0.5 * (Math.abs(curl[idx + 1]) - Math.abs(curl[idx - 1]));
-        let gy = 0.5 * (Math.abs(curl[idx + s]) - Math.abs(curl[idx - s]));
-        const len = Math.hypot(gx, gy) + 1e-5;
-        gx /= len;
-        gy /= len;
-        const c = curl[idx];
-        u[idx] += k * gy * c;
-        v[idx] -= k * gx * c;
-      }
-    }
-  }
+    for (let i = 0; i < count; i++) sorted[--cellStart[(x[i] | 0) + (y[i] | 0) * nx]] = i;
 
-  // 반-라그랑주 이류: 각 셀에서 속도를 거슬러 올라간 지점의 값을 가져온다.
-  _advect(dst, src, u, v, dt, k) {
-    const { w, h, s } = this;
-    const maxX = w + 0.5, maxY = h + 0.5;
-    for (let j = 1; j <= h; j++) {
-      let idx = j * s + 1;
-      for (let i = 1; i <= w; i++, idx++) {
-        let x = i - dt * u[idx], y = j - dt * v[idx];
-        if (x < 0.5) x = 0.5; else if (x > maxX) x = maxX;
-        if (y < 0.5) y = 0.5; else if (y > maxY) y = maxY;
-        const i0 = x | 0, j0 = y | 0;
-        const fx = x - i0, fy = y - j0;
-        const q = i0 + j0 * s;
-        dst[idx] = k * ((1 - fy) * ((1 - fx) * src[q] + fx * src[q + 1]) +
-          fy * ((1 - fx) * src[q + s] + fx * src[q + s + 1]));
-      }
-    }
-  }
-
-  // 압력을 풀어 속도장의 발산을 제거한다 (비압축성).
-  _project() {
-    const { w, h, s, u, v, p, div } = this;
-    for (let j = 1; j <= h; j++) {
-      for (let i = 1; i <= w; i++) {
-        const idx = i + j * s;
-        div[idx] = -0.5 * (u[idx + 1] - u[idx - 1] + v[idx + s] - v[idx - s]);
-      }
-    }
-    // 이전 프레임의 압력을 초기값으로 재사용해 수렴을 앞당긴다.
-    for (let n = 0; n < this.iterations; n++) {
-      for (let j = 1; j <= h; j++) {
-        let idx = j * s + 1;
-        for (let i = 1; i <= w; i++, idx++) {
-          p[idx] = 0.25 * (div[idx] + p[idx - 1] + p[idx + 1] + p[idx - s] + p[idx + s]);
+    // 같은 칸과, 오른쪽·아래쪽 이웃 칸만 살펴 입자 쌍을 한 번씩만 처리한다.
+    const minD2 = MIN_DIST * MIN_DIST, mix = this.mix;
+    const offsets = [0, 1, nx - 1, nx, nx + 1];
+    for (let i = 0; i < count; i++) {
+      const base = (x[i] | 0) + (y[i] | 0) * nx;
+      for (let o = 0; o < 5; o++) {
+        const c = base + offsets[o];
+        for (let k = cellStart[c], end = cellStart[c + 1]; k < end; k++) {
+          const j = sorted[k];
+          if (o === 0 && j <= i) continue;
+          const dx = x[j] - x[i], dy = y[j] - y[i];
+          const d2 = dx * dx + dy * dy;
+          if (d2 >= minD2) continue;
+          if (d2 === 0) {
+            // 완전히 겹친 입자(벽 모서리에 몰린 경우 등)는 임의 방향으로 살짝 떼어 놓는다.
+            x[j] += (Math.random() - 0.5) * 0.02;
+            y[j] += (Math.random() - 0.5) * 0.02;
+            continue;
+          }
+          const d = Math.sqrt(d2);
+          const s = (0.5 * (MIN_DIST - d)) / d;
+          x[i] -= dx * s;
+          y[i] -= dy * s;
+          x[j] += dx * s;
+          y[j] += dy * s;
+          const mr = (r[j] - r[i]) * mix, mg = (g[j] - g[i]) * mix, mb = (b[j] - b[i]) * mix;
+          r[i] += mr; r[j] -= mr;
+          g[i] += mg; g[j] -= mg;
+          b[i] += mb; b[j] -= mb;
         }
       }
-      this._bound(p, 0);
     }
-    for (let j = 1; j <= h; j++) {
-      for (let i = 1; i <= w; i++) {
-        const idx = i + j * s;
-        u[idx] -= 0.5 * (p[idx + 1] - p[idx - 1]);
-        v[idx] -= 0.5 * (p[idx + s] - p[idx - s]);
+  }
+
+  // 입자의 속도·밀도·색을 격자로 옮긴다.
+  _toGrid() {
+    const { x, y, vx, vy, r, g, b, nx, ny, count, u, v, wu, wv, dens, cr, cg, cb, type } = this;
+    for (const k of CLEARED) this[k].fill(0);
+    for (let j = 0; j < ny; j++) {
+      for (let i = 0; i < nx; i++) {
+        type[i + j * nx] = i === 0 || j === 0 || i === nx - 1 || j === ny - 1 ? SOLID : AIR;
       }
     }
-    this._bound(u, 1);
-    this._bound(v, 2);
+
+    for (let p = 0; p < count; p++) {
+      const px = x[p], py = y[p];
+      type[(px | 0) + (py | 0) * nx] = LIQUID;
+
+      // 가로 속도 u는 칸의 왼쪽 면 (i, j+0.5)에 놓인다.
+      let fy = py - 0.5;
+      let i0 = px | 0, j0 = fy | 0;
+      let tx = px - i0, ty = fy - j0;
+      let q = i0 + j0 * nx;
+      let w00 = (1 - tx) * (1 - ty), w10 = tx * (1 - ty), w01 = (1 - tx) * ty, w11 = tx * ty;
+      const pvx = vx[p];
+      u[q] += w00 * pvx; wu[q] += w00;
+      u[q + 1] += w10 * pvx; wu[q + 1] += w10;
+      u[q + nx] += w01 * pvx; wu[q + nx] += w01;
+      u[q + nx + 1] += w11 * pvx; wu[q + nx + 1] += w11;
+
+      // 세로 속도 v는 칸의 위쪽 면 (i+0.5, j)에 놓인다.
+      const fx = px - 0.5;
+      i0 = fx | 0; j0 = py | 0;
+      tx = fx - i0; ty = py - j0;
+      q = i0 + j0 * nx;
+      w00 = (1 - tx) * (1 - ty); w10 = tx * (1 - ty); w01 = (1 - tx) * ty; w11 = tx * ty;
+      const pvy = vy[p];
+      v[q] += w00 * pvy; wv[q] += w00;
+      v[q + 1] += w10 * pvy; wv[q + 1] += w10;
+      v[q + nx] += w01 * pvy; wv[q + nx] += w01;
+      v[q + nx + 1] += w11 * pvy; wv[q + nx + 1] += w11;
+
+      // 밀도와 색은 칸의 중심에 놓인다.
+      j0 = fy | 0;
+      ty = fy - j0;
+      q = i0 + j0 * nx;
+      w00 = (1 - tx) * (1 - ty); w10 = tx * (1 - ty); w01 = (1 - tx) * ty; w11 = tx * ty;
+      const pr = r[p], pg = g[p], pb = b[p];
+      dens[q] += w00; cr[q] += w00 * pr; cg[q] += w00 * pg; cb[q] += w00 * pb;
+      dens[q + 1] += w10; cr[q + 1] += w10 * pr; cg[q + 1] += w10 * pg; cb[q + 1] += w10 * pb;
+      dens[q + nx] += w01; cr[q + nx] += w01 * pr; cg[q + nx] += w01 * pg; cb[q + nx] += w01 * pb;
+      dens[q + nx + 1] += w11; cr[q + nx + 1] += w11 * pr; cg[q + nx + 1] += w11 * pg; cb[q + nx + 1] += w11 * pb;
+    }
+
+    for (let c = 0; c < u.length; c++) {
+      if (wu[c] > 0) u[c] /= wu[c];
+      if (wv[c] > 0) v[c] /= wv[c];
+    }
+    // 벽에 닿은 면은 흐름이 없다.
+    for (let j = 0; j < ny; j++) {
+      u[j * nx] = u[1 + j * nx] = u[nx - 1 + j * nx] = 0;
+      v[j * nx] = v[nx - 1 + j * nx] = 0;
+    }
+    for (let i = 0; i < nx; i++) {
+      v[i] = v[i + nx] = v[i + (ny - 1) * nx] = 0;
+      u[i] = u[i + (ny - 1) * nx] = 0;
+    }
+    this.pu.set(u);
+    this.pv.set(v);
+
+    let n = 0;
+    for (let c = 0; c < type.length; c++) {
+      if (type[c] === LIQUID) this.liquid[n++] = c;
+      else this.p[c] = 0;
+    }
+    this.liquidCount = n;
   }
 
-  // mode 0: 값 복사, 1: 좌우 벽에서 반사(u), 2: 상하 벽에서 반사(v)
-  _bound(f, mode) {
-    const { w, h, s } = this;
-    const sx = mode === 1 ? -1 : 1, sy = mode === 2 ? -1 : 1;
-    for (let j = 1; j <= h; j++) {
-      const row = j * s;
-      f[row] = sx * f[row + 1];
-      f[row + w + 1] = sx * f[row + w];
+  // 액체 칸마다 들어오고 나가는 흐름이 같아지도록 압력을 푼다 (비압축성).
+  // 입자가 과하게 몰린 칸은 바깥으로 밀어내 부피를 유지한다.
+  _solve(dt) {
+    const { u, v, p, dens, nx, liquid, liquidCount, sl, sr, st, sb } = this;
+    const over = 1.9;
+    // 고인 액체의 압력은 거의 변하지 않으므로, 지난 단계의 압력을 먼저 적용하고 시작한다.
+    for (let k = 0; k < liquidCount; k++) {
+      const c = liquid[k];
+      const q = (p[c] *= dt);
+      u[c] -= sl[c] * q;
+      u[c + 1] += sr[c] * q;
+      v[c] -= st[c] * q;
+      v[c + nx] += sb[c] * q;
     }
-    const last = (h + 1) * s;
-    for (let i = 0; i <= w + 1; i++) {
-      f[i] = sy * f[i + s];
-      f[last + i] = sy * f[last + i - s];
+    for (let n = 0; n < this.iterations; n++) {
+      for (let k = 0; k < liquidCount; k++) {
+        const c = liquid[k];
+        let div = u[c + 1] - u[c] + v[c + nx] - v[c];
+        const excess = dens[c] - REST;
+        if (excess > 0) div -= excess;
+        const q = (-div / (sl[c] + sr[c] + st[c] + sb[c])) * over;
+        p[c] += q;
+        u[c] -= sl[c] * q;
+        u[c + 1] += sr[c] * q;
+        v[c] -= st[c] * q;
+        v[c + nx] += sb[c] * q;
+      }
+    }
+    for (let k = 0; k < liquidCount; k++) p[liquid[k]] /= dt;
+  }
+
+  // 격자에서 바뀐 속도를 입자에 되돌린다. 공기뿐인 면은 값이 없으므로 제외한다.
+  _toParticles() {
+    const { x, y, vx, vy, nx, count, u, v, pu, pv, type } = this;
+    const flip = this.flip;
+    for (let p = 0; p < count; p++) {
+      const px = x[p], py = y[p];
+
+      let fy = py - 0.5;
+      let i0 = px | 0, j0 = fy | 0;
+      let tx = px - i0, ty = fy - j0;
+      let q = i0 + j0 * nx;
+      let w00 = type[q] !== AIR || type[q - 1] !== AIR ? (1 - tx) * (1 - ty) : 0;
+      let w10 = type[q + 1] !== AIR || type[q] !== AIR ? tx * (1 - ty) : 0;
+      let w01 = type[q + nx] !== AIR || type[q + nx - 1] !== AIR ? (1 - tx) * ty : 0;
+      let w11 = type[q + nx + 1] !== AIR || type[q + nx] !== AIR ? tx * ty : 0;
+      let sum = w00 + w10 + w01 + w11;
+      if (sum > 0) {
+        const pic = (w00 * u[q] + w10 * u[q + 1] + w01 * u[q + nx] + w11 * u[q + nx + 1]) / sum;
+        const old = (w00 * pu[q] + w10 * pu[q + 1] + w01 * pu[q + nx] + w11 * pu[q + nx + 1]) / sum;
+        vx[p] = flip * (vx[p] + pic - old) + (1 - flip) * pic;
+      }
+
+      const fx = px - 0.5;
+      i0 = fx | 0; j0 = py | 0;
+      tx = fx - i0; ty = py - j0;
+      q = i0 + j0 * nx;
+      w00 = type[q] !== AIR || type[q - nx] !== AIR ? (1 - tx) * (1 - ty) : 0;
+      w10 = type[q + 1] !== AIR || type[q + 1 - nx] !== AIR ? tx * (1 - ty) : 0;
+      w01 = type[q + nx] !== AIR || type[q] !== AIR ? (1 - tx) * ty : 0;
+      w11 = type[q + nx + 1] !== AIR || type[q + 1] !== AIR ? tx * ty : 0;
+      sum = w00 + w10 + w01 + w11;
+      if (sum > 0) {
+        const pic = (w00 * v[q] + w10 * v[q + 1] + w01 * v[q + nx] + w11 * v[q + nx + 1]) / sum;
+        const old = (w00 * pv[q] + w10 * pv[q + 1] + w01 * pv[q + nx] + w11 * pv[q + nx + 1]) / sum;
+        vy[p] = flip * (vy[p] + pic - old) + (1 - flip) * pic;
+      }
     }
   }
-}
-
-function bilerp(f, s, x, y) {
-  const i0 = x | 0, j0 = y | 0;
-  const fx = x - i0, fy = y - j0;
-  const q = i0 + j0 * s;
-  return (1 - fy) * ((1 - fx) * f[q] + fx * f[q + 1]) + fy * ((1 - fx) * f[q + s] + fx * f[q + s + 1]);
 }
